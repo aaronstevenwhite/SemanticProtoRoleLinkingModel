@@ -51,56 +51,54 @@ class Sprolim(object):
         self._initialize_loss()
         
     def _initialize_maps(self):
-        self.ltr_perms = {}
-        self.position_role_map = {}
+        self.role_perms = {}
+        self.ltr_perms = default(dict)
+        self.position_role_map = default(dict)
 
-        self.num_of_ltr_perms = {}
+        self.nltrperms = default(dict)
 
-        role_combs = list(combinations_with_replacement(range(self.nprotoroles), self.max_ltrs))
-        self.role_perms = np.array(list({tuple(perm) for comb in role_combs for perm in permutations(comb)}))
-        
-        for j in self.unique_nargs:
-            ltr_perms = np.array(list({tuple(perm[:j]) for perm in np.array(list(permutations(range(self.max_ltrs))))}))
-            self.ltr_perms[j] = ltr_perms[np.lexsort(np.transpose(ltr_perms)[::-1])]
-            
-            self.position_role_map[j] = theano.shared(np.transpose(self.role_perms[:,self.ltr_perms[j]], (2,0,1)),
-                                                   name='position_role_map'+str(j)+self.ident)
+        for i, outer_partition in self.data.iteritems():
+            role_combs = list(combinations_with_replacement(range(self.nprotoroles), i))
+            self.role_perms[i] = np.array(list({tuple(perm) for comb in role_combs for perm in permutations(comb)}))
 
-            self.num_of_ltr_perms[j] = self.ltr_perms[j].shape[0]
+            for j, inner_partition in outer_partition.iteritems():
+                ltr_perms = np.array(list({tuple(perm[:j]) for perm in np.array(list(permutations(range(i))))}))
+                self.ltr_perms[i][j] = ltr_perms[np.lexsort(np.transpose(ltr_perms)[::-1])]
+
+                self.position_role_map[i][j] = theano.shared(np.transpose(self.role_perms[i][:,self.ltr_perms[i][j]], (2,0,1)),
+                                                             name='position_role_map'+str(i)+str(j)+self._ident)
+
+                self.nltrperms[i][j] = self.ltr_perms[i][j].shape[0]
 
         
     def _initialize_mixture(self):
-        role_ll = {}
+        role_ll = defaultdict(dict)
         
-        for i, data in self.data_split.iteritems():
-            mixture_aux = np.zeros([data.num_of_rolesets_total, data.max_ltrs, self.nprotoroles])
+        for i, outer_partition in self.data.predicate.iteritems():
+            mixture_aux = np.zeros([self.data.npredicates_total, i, self.nprotoroles])
 
             self._representations['mixture_'+str(i)] = theano.shared(mixture_aux,
-                                                                   name='mixture'+str(i)+self.ident)
+                                                                     name='mixture'+str(i)+self.ident)
 
             mixture_exp = T.exp(self._representations['mixture_'+str(i)])
             mixture = mixture_exp / T.sum(mixture_exp, axis=2)[:,:,None]
 
             log_mixture = T.log(T.swapaxes(mixture, 0, 2))
 
-            role_perms_logprob = T.sum(log_mixture[data.role_perms,T.arange(i)[None,:]], axis=1)
+            role_perms_logprob = T.sum(log_mixture[self.role_perms[i],T.arange(i)[None,:]], axis=1)
             
-            role_ll[i] = {}
-            
-            for j in data.unique_argnums:
-                log_divisor = T.log(data.num_of_sents_per_roleset[data.roleset[j]])
-                role_ll[i][j] = T.transpose(role_perms_logprob)[data.roleset[j]] -\
+            for j, inner_partition in outer_partition.iteritems():
+                log_divisor = T.log(self.data.nsents_per_predicate[inner_partition])
+                role_ll[i][j] = T.transpose(role_perms_logprob)[inner_partition] -\
                                 log_divisor[:,None]
                 
         self._role_ll = role_ll
-        self._role_prior = (self.alpha - 1.)*T.sum(log_mixture)
+        # self._role_prior = (self.alpha - 1.)*T.sum(log_mixture)
 
     def _initialize_canonicalization(self):
-        canon_ll = {}
+        canon_ll = defaultdict(dict)
         
-        for i, data in self.data_split.iteritems():
-            canon_ll[i] = {}
-            
+        for i, data in self.data_split.iteritems():            
             for j in data.unique_argnums:
                 # canonicalization_prob_aux = np.random.normal(0., 1., [data.num_of_rolesets[j],
                 #                                                       data.num_of_ltr_perms[j]])
@@ -319,7 +317,7 @@ class Sprolim(object):
         Parameters
         ----------
         data : sprolim.SprolimData
-        Wrapped SPR1 or SPR2 data
+            Wrapped SPR1 or SPR2 data
 
         iterations : int        
         tolerance : float
@@ -327,8 +325,9 @@ class Sprolim(object):
         fix_params : bool
         verbose : bool
         '''
+
+        self.data = data
         
-        self._initialize_data()
         self._initialize_model()
         
         self._initialize_updaters(fix_params)
@@ -650,119 +649,4 @@ class Sprolim(object):
         self.mixture_canonicalized.to_csv(name('mixture_canonicalized')+str(self.nprotoroles)+'.csv')
         self.metrics.to_csv(name('metrics')+str(self.nprotoroles)+'.csv')
         self.prediction.to_csv(name('prediction')+str(self.nprotoroles)+'.csv')
-        self.confusion.to_csv(name('confusion')+str(self.nprotoroles)+'.csv') 
-    
-class SprolimModelSelection(object):
-
-    def __init__(self, data, rolenums=range(2,5)):
-        self.data = data
-        self.rolenums = rolenums
-
-    def run_train_test(self, train_prop=0.9, init_tolerance=1000., train_tolerance=1., test_tolerance=0.1):
-        if init_tolerance is not None:
-            self._train_initialization(init_tolerance)
-        
-        train_roleset, test_roleset = train_test_split(self.data.roleset.unique(),
-                                                     train_size=train_prop)
-
-        data_train = self.data[self.data.roleset.isin(train_roleset)]
-        data_test = self.data[self.data.roleset.isin(test_roleset)]
-        
-        self.train_mods = {}
-        self.test_mods = {}
-        
-        self.metrics_test = {}
-        self.metrics_train = {}
-        
-        for i in self.rolenums:
-            self.train_mods[i] = {}
-            self.test_mods[i] = {}
-
-            self.metrics_train[i] = {}
-            self.metrics_test[i] = {}
-            
-            self._fit(i, 0, data_train, data_test,
-                      init_tolerance, train_tolerance, test_tolerance)
-        
-
-        
-    def run_cv(self, folds=5, init_tolerance=1000., train_tolerance=1., test_tolerance=0.1):
-        if init_tolerance is not None:
-            self._train_initialization(init_tolerance)
-
-        self.train_mods = {}
-        self.test_mods = {}
-        
-        self.metrics_test = {}
-        self.metrics_train = {}
-        
-        for i in self.rolenums:
-            self.train_mods[i] = {}
-            self.test_mods[i] = {}
-
-            self.metrics_train[i] = {}
-            self.metrics_test[i] = {}
-
-            folder = LabelKFold(labels=self.data.sentenceid, n_folds=folds)
-            
-            for j, (train_index, test_index) in enumerate(folder):
-
-                data_train = self.data.iloc[train_index]
-                data_test = self.data.iloc[test_index]
-
-                print
-                print 'Iteration ', j
-                print
-                
-                self._fit(i, j, data_train, data_test,
-                          init_tolerance, train_tolerance, test_tolerance)
-            
-        return self
-
-    def _train_initialization(self, init_tolerance):
-        self.init_mods = {}
-        
-        for i in self.rolenums:
-            print
-            print 'Training initialization model ', i
-            print
-
-            self.init_mods[i] = Sprolim(data=self.data, k=i)
-            self.init_mods[i].fit(tolerance=init_tolerance, verbose=True)
-
-            print
-            print 'Initialization metrics'
-            print self.init_mods[i].metrics
-
-    
-    def _fit(self, i, j, data_train, data_test, init_tolerance, train_tolerance, test_tolerance):
-        print 'Training model ', i
-        print
-
-        if init_tolerance is not None:
-            self.train_mods[i][j] = Sprolim(data=data_train, k=i,
-                                            initialized_model=self.init_mods[i])
-        else:
-            self.train_mods[i][j] = Sprolim(data=data_train, k=i)
-
-        self.train_mods[i][j].fit(tolerance=train_tolerance, gd_init=False, verbose=True)
-
-        print
-        print 'Testing model ', i
-        print
-
-        self.test_mods[i][j] = Sprolim(data=data_test,
-                                       initialized_model=self.train_mods[i][j],
-                                       fix_params=True)
-        self.test_mods[i][j].fit(tolerance=test_tolerance, verbose=True)
-
-        self.metrics_train[i][j] = self.train_mods[i][j].metrics
-        self.metrics_test[i][j] = self.test_mods[i][j].metrics
-
-        print
-        print 'Train metrics'
-        print self.metrics_train[i][j]
-        print
-        print 'Test metrics'
-        print self.metrics_test[i][j]
-        print
+        self.confusion.to_csv(name('confusion')+str(self.nprotoroles)+'.csv')
