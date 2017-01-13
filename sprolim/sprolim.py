@@ -24,80 +24,61 @@ warnings.simplefilter(action = "ignore")
 
 class Sprolim(object):
     
-    def __init__(self, data, k=2, alpha=1., ycats=['subject', 'object', 'oblique'],
-                 initialized_model=None, semantics_only=False):
-        self.data = data
-        self.k = k if initialized_model is None else initialized_model.k
-        self.alpha = alpha if initialized_model is None else initialized_model.alpha
+    def __init__(self, nprotoroles=2):
+        '''
+        Parameters
+        ----------
+        nprotoroles : int
+            the number of protoroles the model assumes
+        '''
+
+        self.nprotoroles = nprotoroles
         
-        self.ycats = np.array(ycats)
-        self.initialized_model = initialized_model
-        self.semantics_only = semantics_only
+        self._ident = ''.join([str(i) for i in np.random.choice(9, size=10)])
         
-        self.ident = ''.join([str(i) for i in np.random.choice(9, size=10)])
+    def _initialize_model(self):
 
-        self._initialize_data()
-        self._initialize_model()
+        self._initialize_maps()
         
-    def _initialize_data(self):
+        self._representations = {}
         
-        self._create_syntactic_predictors()
+        self._initialize_mixture()
+        self._initialize_canonicalization()
+        self._initialize_applicability()
+        self._initialize_rating()
+        self._initialize_syntax()
 
-        maxargs = self.data.groupby('roleset').argnum.apply(np.max).reset_index()
-        self.data = pd.merge(self.data, maxargs.rename(columns={'argnum' : 'maxargnum'}))
-        self.max_ltrs = np.max(self.data.maxargnum)
-
-        self.data['argposrel'] = self.data.groupby(['sentenceid', 'roleset']).argposud.apply(get_codes)
+        self._initialize_loss()
         
-        self.data_split = {i : Data(self.data[self.data.maxargnum==i], self.k, self.ycats) for i in self.data.maxargnum.unique()}
+    def _initialize_maps(self):
+        self.ltr_perms = {}
+        self.position_role_map = {}
 
-        self.num_of_properties = get_num_of_types(self.data.property)
-        self.num_of_syntpos = get_num_of_types(self.data.gramfuncud)
-                
+        self.num_of_ltr_perms = {}
 
-    def _create_syntactic_predictors(self):
-        self.data['indicator'] = 1
-
-        ind = ['sentenceid', 'roleset', 'predtokenud', 'argposud', 'property']
-        col = ['gramfuncud']
+        role_combs = list(combinations_with_replacement(range(self.nprotoroles), self.max_ltrs))
+        self.role_perms = np.array(list({tuple(perm) for comb in role_combs for perm in permutations(comb)}))
         
-        y_frame = self.data.pivot_table(index=ind,
-                              columns=col,
-                              values='indicator',
-                              fill_value=0).reset_index()
-
-        count_by_sent = self.data.pivot_table(index=ind[:2],
-                                              columns=col,
-                                              values='indicator',
-                                              aggfunc=max,
-                                              fill_value=0).reset_index()
-
-        count_by_arg = self.data.pivot_table(index=ind,
-                                             columns=col,
-                                             values='indicator',
-                                             aggfunc=sum,
-                                             fill_value=0).reset_index()
-        
-        y_cast = pd.merge(count_by_sent, count_by_arg, on=ind[:2])
-    
-        self.data = pd.merge(self.data, y_cast, on=ind, how='outer')
-        
-        for position in self.ycats:
-            self.data[position] = np.maximum(np.array(self.data[position+'_x'] - self.data[position+'_y']), 0)
-
-        self.other_positions = self.data[self.ycats]
-
+        for j in self.unique_nargs:
+            ltr_perms = np.array(list({tuple(perm[:j]) for perm in np.array(list(permutations(range(self.max_ltrs))))}))
+            self.ltr_perms[j] = ltr_perms[np.lexsort(np.transpose(ltr_perms)[::-1])]
             
+            self.position_role_map[j] = theano.shared(np.transpose(self.role_perms[:,self.ltr_perms[j]], (2,0,1)),
+                                                   name='position_role_map'+str(j)+self.ident)
+
+            self.num_of_ltr_perms[j] = self.ltr_perms[j].shape[0]
+
+        
     def _initialize_mixture(self):
         role_ll = {}
         
         for i, data in self.data_split.iteritems():
-            mixture_aux = np.zeros([data.num_of_rolesets_total, data.max_ltrs, self.k])
+            mixture_aux = np.zeros([data.num_of_rolesets_total, data.max_ltrs, self.nprotoroles])
 
-            self.representations['mixture_'+str(i)] = theano.shared(mixture_aux,
+            self._representations['mixture_'+str(i)] = theano.shared(mixture_aux,
                                                                    name='mixture'+str(i)+self.ident)
 
-            mixture_exp = T.exp(self.representations['mixture_'+str(i)])
+            mixture_exp = T.exp(self._representations['mixture_'+str(i)])
             mixture = mixture_exp / T.sum(mixture_exp, axis=2)[:,:,None]
 
             log_mixture = T.log(T.swapaxes(mixture, 0, 2))
@@ -111,7 +92,8 @@ class Sprolim(object):
                 role_ll[i][j] = T.transpose(role_perms_logprob)[data.roleset[j]] -\
                                 log_divisor[:,None]
                 
-        return role_ll, (self.alpha - 1.)*T.sum(log_mixture)
+        self._role_ll = role_ll
+        self._role_prior = (self.alpha - 1.)*T.sum(log_mixture)
 
     def _initialize_canonicalization(self):
         canon_ll = {}
@@ -126,27 +108,27 @@ class Sprolim(object):
                 canonicalization_prob_aux = np.tile(1./np.arange(1, data.num_of_ltr_perms[j]+1),
                                                     [data.num_of_rolesets[j], 1])
                 
-                self.representations['canonicalization_'+str(i)+str(j)] = theano.shared(canonicalization_prob_aux,
+                self._representations['canonicalization_'+str(i)+str(j)] = theano.shared(canonicalization_prob_aux,
                                                                                 name='canonicalization_prob'+str(i)+str(j)+self.ident)
 
-                canonicalization_exp = T.exp(self.representations['canonicalization_'+str(i)+str(j)])
+                canonicalization_exp = T.exp(self._representations['canonicalization_'+str(i)+str(j)])
                 canonicalization_prob = canonicalization_exp / T.sum(canonicalization_exp, axis=1)[:,None]
                 canonicalization_logprob = T.log(canonicalization_prob)[data.rolesettokenindices[j]]
 
                 canon_ll[i][j] = canonicalization_logprob[data.sentroleset[j],None,:] - T.log(j)
             
-        return canon_ll
+        self._canonicalization_ll = canon_ll
 
     def _initialize_applicability(self):
         if self.initialized_model is None:
-            #appl_aux = np.random.normal(0, 1, size=[self.k, self.num_of_properties, 2])
-            appl_aux = np.zeros([self.k, self.num_of_properties, 2])
+            #appl_aux = np.random.normal(0, 1, size=[self.nprotoroles, self.num_of_properties, 2])
+            appl_aux = np.zeros([self.nprotoroles, self.num_of_properties, 2])
         else:
             appl_aux = self.initialized_model.representations['applicable'].eval()
 
-        self.representations['applicable'] = theano.shared(appl_aux, name='appl'+self.ident)
+        self._representations['applicable'] = theano.shared(appl_aux, name='appl'+self.ident)
 
-        appl_exp = T.exp(self.representations['applicable'])
+        appl_exp = T.exp(self._representations['applicable'])
         appl_prob = appl_exp / T.sum(appl_exp, axis=2)[:,:,None]
 
         appl_ll = {}
@@ -158,29 +140,29 @@ class Sprolim(object):
                                              data.property[j][:,None,None],
                                              data.applicable[j][:,None,None]])
 
-        return appl_ll
+        self._appl_ll = appl_ll
 
     def _initialize_rating(self):
         if self.initialized_model is None:
-            #rating_aux = np.random.normal(0, 1, size=[self.k, self.num_of_properties])
-            rating_aux = np.zeros([self.k, self.num_of_properties])
+            #rating_aux = np.random.normal(0, 1, size=[self.nprotoroles, self.num_of_properties])
+            rating_aux = np.zeros([self.nprotoroles, self.num_of_properties])
         else:
             rating_aux = self.initialized_model.representations['rating'].eval()
 
-        self.representations['rating'] = theano.shared(rating_aux, name='rating'+self.ident)
+        self._representations['rating'] = theano.shared(rating_aux, name='rating'+self.ident)
 
         if self.initialized_model is None:
             jumps_aux = np.array([-np.inf] + [1]*(np.max(self.data.response)-1) + [-np.inf])
         else:
             jumps_aux = self.initialized_model.representations['jumps'].eval()
             
-        self.representations['jumps'] = theano.shared(jumps_aux, name='jumps'+self.ident)
+        self._representations['jumps'] = theano.shared(jumps_aux, name='jumps'+self.ident)
 
-        jumps = T.exp(self.representations['jumps'])
+        jumps = T.exp(self._representations['jumps'])
         cuts = T.extra_ops.cumsum(jumps)
         cuts_centered = cuts - cuts[(np.max(self.data.response)-1)/2]
 
-        rating_logprob_cum = cuts_centered[None,None,:] - self.representations['rating'][:,:,None]
+        rating_logprob_cum = cuts_centered[None,None,:] - self._representations['rating'][:,:,None]
 
 
         rating_prob_cum = (1. / (1. + T.exp(-rating_logprob_cum)))
@@ -215,11 +197,11 @@ class Sprolim(object):
 
                 rate_ll[i][j] = data.applicable[j][:,None,None]*T.log(rate_prob)
 
-        return rate_ll
+        self._rate_ll = rate_ll
     
     def _initialize_syntax(self):
         if self.initialized_model is None:
-            role_synt_aux = np.random.normal(0., 1., size=[self.num_of_syntpos,self.k])
+            role_synt_aux = np.random.normal(0., 1., size=[self.num_of_syntpos,self.nprotoroles])
             synt_synt_aux = LogisticRegression(fit_intercept=False,
                                    multi_class='multinomial',
                                    solver='newton-cg').fit(self.other_positions,
@@ -229,11 +211,11 @@ class Sprolim(object):
             role_synt_aux = self.initialized_model.representations['role_syntax'].eval()
             synt_synt_aux = self.initialized_model.representations['syntax_syntax'].eval()
             
-        self.representations['role_syntax'] = theano.shared(role_synt_aux, name='role_synt'+self.ident)
-        role_synt = self.representations['role_syntax']
+        self._representations['role_syntax'] = theano.shared(role_synt_aux, name='role_synt'+self.ident)
+        role_synt = self._representations['role_syntax']
 
-        self.representations['syntax_syntax'] = theano.shared(synt_synt_aux, name='synt_synt'+self.ident)
-        synt_synt = self.representations['syntax_syntax']
+        self._representations['syntax_syntax'] = theano.shared(synt_synt_aux, name='synt_synt'+self.ident)
+        synt_synt = self._representations['syntax_syntax']
 
         synt_ll = {}
         
@@ -253,30 +235,11 @@ class Sprolim(object):
                                           data.position_role_map[j][data.argposrel[j]]]
                 synt_ll[i][j] = synt_ll[i][j] - T.log(float(self.num_of_properties))
  
-        return synt_ll
-            
-    
-    def _initialize_model(self):
+        self._synt_ll = synt_ll
 
-        self.representations = {}
-        
-        ## mixture
-        role_ll, role_prior_ll = self._initialize_mixture()
-        
-        ## canonicalization
-        canonicalization_ll = self._initialize_canonicalization()
-        
-        ## applicability components
-        appl_ll = self._initialize_applicability()
-        
-        ## rating components
-        rating_ll = self._initialize_rating()
-        
-        ## syntactic position components
-        syntax_ll = self._initialize_syntax()
-
-        self.total_loglike_sum = 0.
-        self.total_loglike_sum_synt_only = 0.
+    def _initialize_loss(self):
+        self._total_loglike_sum = 0.
+        self._total_loglike_sum_synt_only = 0.
 
         self._role_perm = {}
         
@@ -285,33 +248,40 @@ class Sprolim(object):
             
             for j in data.unique_argnums:
                 ## likelihood
-                inner_sum = canonicalization_ll[i][j]+appl_ll[i][j]+rating_ll[i][j]
+                inner_sum = self._canonicalization_ll[i][j]+\
+                            self._appl_ll[i][j]+\
+                            self._rating_ll[i][j]
                 
                 if not self.semantics_only:
-                    inner_sum += syntax_ll[i][j]
+                    inner_sum += self._syntax_ll[i][j]
 
-                self._role_perm[i][j] = role_ll[i][j][:,:,None] + inner_sum
+                self._role_perm[i][j] = self._role_ll[i][j][:,:,None] + inner_sum
                     
                 perm_ll = T.log(T.sum(T.exp(inner_sum), axis=2))
                 
-                self.total_loglike_sum += T.sum(T.log(T.sum(T.exp(role_ll[i][j] + perm_ll), axis=1)))
+                self._total_loglike_sum += T.sum(T.log(T.sum(T.exp(self._role_ll[i][j] +\
+                                                                   perm_ll),
+                                                            axis=1)))
 
-                inner_sum_synt_only = canonicalization_ll[i][j]+syntax_ll[i][j]
+                inner_sum_synt_only = self._canonicalization_ll[i][j]+self._syntax_ll[i][j]
                 perm_ll_synt_only = T.log(T.sum(T.exp(inner_sum_synt_only), axis=2))
 
-                self.total_loglike_sum_synt_only += T.sum(T.log(T.sum(T.exp(role_ll[i][j] + perm_ll_synt_only), axis=1)))
+                self._total_loglike_sum_synt_only += T.sum(T.log(T.sum(T.exp(self._role_ll[i][j] +\
+                                                                            perm_ll_synt_only),
+                                                                      axis=1)))
                 
-        self.total_loglike_sum += role_prior_ll
-                
+        self._total_loglike_sum += self._role_prior_ll
+
+
     def _initialize_updaters(self, fix_params):
         update_dict_gd = []
         update_dict_ada = []
 
         self.rep_grad_hist_t = {}
         
-        for name, rep in self.representations.items():            
+        for name, rep in self._representations.items():            
             if not fix_params or name.split('_')[0] in ['canonicalization', 'mixture']:
-                rep_grad = T.grad(self.total_loglike_sum, rep)
+                rep_grad = T.grad(self._total_loglike_sum, rep)
 
                 # if self.initialized_model is None or name.split('_')[0] in ['canonicalization', 'mixture']:
                 self.rep_grad_hist_t[name] = theano.shared(np.ones(rep.shape.eval()), name=name+'_hist'+self.ident)
@@ -332,20 +302,35 @@ class Sprolim(object):
                                     (rep, rep + rep_grad_adj)]  
             
         self.updater_gd = theano.function(inputs=[],
-                                          outputs=[self.total_loglike_sum,
-                                                   self.total_loglike_sum_synt_only],
+                                          outputs=[self._total_loglike_sum,
+                                                   self._total_loglike_sum_synt_only],
                                           updates=update_dict_gd,
                                           name='updater_gd_'+self.ident)
 
         self.updater_ada = theano.function(inputs=[],
-                                           outputs=[self.total_loglike_sum,
-                                                    self.total_loglike_sum_synt_only],
+                                           outputs=[self._total_loglike_sum,
+                                                    self._total_loglike_sum_synt_only],
                                            updates=update_dict_ada,
                                            name='updater_ada'+self.ident)
 
 
-    def fit(self, iterations=1000, tolerance=1., gd_init=True, fix_params=False, verbose=False):
+    def fit(self, data, iterations=1000, tolerance=1., gd_init=True, fix_params=False, verbose=False):
+        '''
+        Parameters
+        ----------
+        data : sprolim.SprolimData
+        Wrapped SPR1 or SPR2 data
 
+        iterations : int        
+        tolerance : float
+        gd_init : bool
+        fix_params : bool
+        verbose : bool
+        '''
+        
+        self._initialize_data()
+        self._initialize_model()
+        
         self._initialize_updaters(fix_params)
         
         prev_ll = -np.inf
@@ -374,13 +359,13 @@ class Sprolim(object):
                 
     def compute_deviance_aic(self, syntax_only=False):
         if syntax_only:
-            num_params = [np.prod(rep.shape.eval()) for name, rep in self.representations.items()
+            num_params = [np.prod(rep.shape.eval()) for name, rep in self._representations.items()
                           if name not in ['applicable', 'rating', 'jumps']]
             
             return -2*self.ll_synt_only, -2*self.ll_synt_only + 2*np.sum(num_params)
 
         else:
-            num_params = [np.prod(rep.shape.eval()) for rep in self.representations.values()]
+            num_params = [np.prod(rep.shape.eval()) for rep in self._representations.values()]
 
             return -2*self.ll, -2*self.ll + 2*np.sum(num_params)
     
@@ -389,13 +374,13 @@ class Sprolim(object):
         mixture_dict = {}
         
         for i, data in self.data_split.iteritems():
-            mixture_exp = T.exp(self.representations['mixture_'+str(i)])
+            mixture_exp = T.exp(self._representations['mixture_'+str(i)])
             mixture = (mixture_exp / T.sum(mixture_exp, axis=2)[:,:,None]).eval()
 
             mixture_dict[i] = pd.Panel(mixture,
                                           items=data.rolesets_list,
                                           major_axis=['ltr'+str(j) for j in range(data.max_ltrs)],
-                                          minor_axis=['role'+str(j) for j in range(self.k)])
+                                          minor_axis=['role'+str(j) for j in range(self.nprotoroles)])
 
         return mixture_dict
             
@@ -406,7 +391,7 @@ class Sprolim(object):
         for i, data in self.data_split.iteritems():
             canon_dict[i] = {}
             for j in data.unique_argnums:
-                canon_exp = T.exp(self.representations['canonicalization_'+str(i)+str(j)])
+                canon_exp = T.exp(self._representations['canonicalization_'+str(i)+str(j)])
                 canon_prob = (canon_exp / T.sum(canon_exp, axis=1)[:,None])
 
                 canon_dict[i][j] = pd.DataFrame(canon_prob.eval(),
@@ -434,7 +419,7 @@ class Sprolim(object):
                                                           ltr_perm_selected],
                                                items=rsets,
                                                major_axis=[str(k) for k in range(j)],
-                                               minor_axis=['role'+str(k) for k in range(self.k)])
+                                               minor_axis=['role'+str(k) for k in range(self.nprotoroles)])
                                                
 
                 mixcanon = pd.melt(mixcanon.to_frame().reset_index(),
@@ -459,12 +444,12 @@ class Sprolim(object):
     
     @property
     def rating(self):
-        return pd.DataFrame(np.transpose(self.representations['rating'].eval()),
+        return pd.DataFrame(np.transpose(self._representations['rating'].eval()),
                             index=self.data.property.astype('category').cat.categories)
 
     @property
     def applicable(self):
-        appl_exp = T.exp(self.representations['applicable'])
+        appl_exp = T.exp(self._representations['applicable'])
         appl = (appl_exp / T.sum(appl_exp, axis=2)[:,:,None])
 
         return pd.DataFrame(np.transpose(appl[:,:,1].eval()),
@@ -472,12 +457,12 @@ class Sprolim(object):
 
     @property
     def role_syntax(self):
-        return pd.DataFrame(self.representations['role_syntax'].eval(),
-                            columns=['role'+str(i) for i in range(self.k)], index=self.ycats)
+        return pd.DataFrame(self._representations['role_syntax'].eval(),
+                            columns=['role'+str(i) for i in range(self.nprotoroles)], index=self.ycats)
 
     @property
     def syntax_syntax(self):
-        return pd.DataFrame(self.representations['syntax_syntax'].eval(), index=self.ycats, columns=self.ycats)
+        return pd.DataFrame(self._representations['syntax_syntax'].eval(), index=self.ycats, columns=self.ycats)
 
     def predict_ltr(self, maximize=False):
 
@@ -500,8 +485,8 @@ class Sprolim(object):
     
     def predict(self, maximize=False):
         ## extract the role-syntax and syntax-syntax parameters
-        params_Xy = self.representations['role_syntax'].eval()
-        params_yy = self.representations['syntax_syntax'].eval()
+        params_Xy = self._representations['role_syntax'].eval()
+        params_yy = self._representations['syntax_syntax'].eval()
 
         ## extract the mixture and canonicalization probabilities
         mixtures = self.mixture
@@ -575,7 +560,7 @@ class Sprolim(object):
                     # mixture_maxed = np.transpose(np.eye(j)[np.argmax(mixture_selected, axis=1)], (0,2,1))
                     # mixture_maxed += (1-np.sum(mixture_maxed, axis=2))[:,:,None]*mixture_selected
 
-                    mixture_maxed = np.eye(self.k)[np.argmax(mixture_selected, axis=2)]
+                    mixture_maxed = np.eye(self.nprotoroles)[np.argmax(mixture_selected, axis=2)]
                     
                     sent_perm_prob = np.sum(synt_logprobs[None,:,:,:] * mixture_maxed[:,None,:,:],
                                             axis=(2,3))
@@ -658,14 +643,14 @@ class Sprolim(object):
     def write(self):
         name = lambda x: x+'_retrained' if self.semantics_only else x
 
-        self.rating.to_csv(name('rating')+str(self.k)+'.csv')
-        self.applicable.to_csv(name('applicable')+str(self.k)+'.csv')
-        self.syntax_syntax.to_csv(name('syntax_syntax')+str(self.k)+'.csv')
-        self.role_syntax.to_csv(name('role_syntax')+str(self.k)+'.csv')
-        self.mixture_canonicalized.to_csv(name('mixture_canonicalized')+str(self.k)+'.csv')
-        self.metrics.to_csv(name('metrics')+str(self.k)+'.csv')
-        self.prediction.to_csv(name('prediction')+str(self.k)+'.csv')
-        self.confusion.to_csv(name('confusion')+str(self.k)+'.csv') 
+        self.rating.to_csv(name('rating')+str(self.nprotoroles)+'.csv')
+        self.applicable.to_csv(name('applicable')+str(self.nprotoroles)+'.csv')
+        self.syntax_syntax.to_csv(name('syntax_syntax')+str(self.nprotoroles)+'.csv')
+        self.role_syntax.to_csv(name('role_syntax')+str(self.nprotoroles)+'.csv')
+        self.mixture_canonicalized.to_csv(name('mixture_canonicalized')+str(self.nprotoroles)+'.csv')
+        self.metrics.to_csv(name('metrics')+str(self.nprotoroles)+'.csv')
+        self.prediction.to_csv(name('prediction')+str(self.nprotoroles)+'.csv')
+        self.confusion.to_csv(name('confusion')+str(self.nprotoroles)+'.csv') 
     
 class SprolimModelSelection(object):
 
