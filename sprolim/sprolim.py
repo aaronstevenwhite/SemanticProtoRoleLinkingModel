@@ -146,15 +146,18 @@ class Sprolim(object):
         # else:
         #     rating_aux = self.initialized_model.representations['rating'].eval()
 
-        rating_aux = np.zeros([self.nprotoroles, self.num_of_properties])
+        rating_aux = np.zeros([self.nprotoroles, self.data.nproperties])
             
         self._representations['rating'] = theano.shared(rating_aux, name='rating'+self.ident)
 
-        if self.initialized_model is None:
-            jumps_aux = np.array([-np.inf] + [1]*(np.max(self.data.response)-1) + [-np.inf])
-        else:
-            jumps_aux = self.initialized_model.representations['jumps'].eval()
-            
+        # if self.initialized_model is None:
+        #     jumps_aux = np.array([-np.inf] + [1]*(np.max(self.data.response)-1) + [-np.inf])
+        # else:
+        #     jumps_aux = self.initialized_model.representations['jumps'].eval()
+
+        jumps_aux = np.array([-np.inf] + [1]*(np.max(self.data.response)-1) + [-np.inf])
+
+        
         self._representations['jumps'] = theano.shared(jumps_aux, name='jumps'+self.ident)
 
         jumps = T.exp(self._representations['jumps'])
@@ -196,43 +199,71 @@ class Sprolim(object):
 
                 rate_ll[i][j] = data.applicable[j][:,None,None]*T.log(rate_prob)
 
+        cuts = self._initialize_cutpoints()
+        #scale = self._initialize_scale()[:,None]
+
+        ll = 0.
+        
+        for i in np.unique(self._response):
+            annotator_idx = self._annotator_codes[i]
+            fixed_idx = self._fixed_codes[i]
+
+            if i < self._max_response:
+                upper = cuts[annotator_idx, i] - self._normalized[fixed_idx]
+                upper_cumprob = logisticT(upper)#/scale)
+            else:
+                upper_cumprob = 1.
+
+            if i > 0:
+                lower = cuts[annotator_idx, i-1] - self._normalized[fixed_idx]
+                lower_cumprob = logisticT(lower)#/scale)
+            else:
+                lower_cumprob = 0.
+
+            ll += T.sum(T.log(upper_cumprob-lower_cumprob+1e-20))
+
+                
         self._rate_ll = rate_ll
     
     def _initialize_syntax(self):
-        if self.initialized_model is None:
-            role_synt_aux = np.random.normal(0., 1., size=[self.num_of_syntpos,self.nprotoroles])
-            synt_synt_aux = LogisticRegression(fit_intercept=False,
-                                   multi_class='multinomial',
-                                   solver='newton-cg').fit(self.other_positions,
-                                                           self.data.gramfuncud).coef_
+        # if self.initialized_model is None:
+        #     role_synt_aux = np.random.normal(0., 1., size=[self.num_of_syntpos,self.nprotoroles])
+        #     synt_synt_aux = LogisticRegression(fit_intercept=False,
+        #                            multi_class='multinomial',
+        #                            solver='newton-cg').fit(self.other_positions,
+        #                                                    self.data.gramfuncud).coef_
+        # 
+        # else:
+        #     role_synt_aux = self.initialized_model.representations['role_syntax'].eval()
+        #     synt_synt_aux = self.initialized_model.representations['syntax_syntax'].eval()
 
-        else:
-            role_synt_aux = self.initialized_model.representations['role_syntax'].eval()
-            synt_synt_aux = self.initialized_model.representations['syntax_syntax'].eval()
-            
+        role_synt_aux = np.random.normal(0., 1., size=[self.num_of_syntpos,self.nprotoroles])
+        synt_synt_aux = LogisticRegression(fit_intercept=False,
+                                           multi_class='multinomial',
+                                           solver='newton-cg').fit(self.data.gramfunc_global,
+                                                                   self.data.gramfunc).coef_
+  
         self._representations['role_syntax'] = theano.shared(role_synt_aux, name='role_synt'+self.ident)
         role_synt = self._representations['role_syntax']
 
         self._representations['syntax_syntax'] = theano.shared(synt_synt_aux, name='synt_synt'+self.ident)
         synt_synt = self._representations['syntax_syntax']
 
-        synt_ll = {}
+        synt_ll = defaultdict(dict)
         
-        for i, data in self.data_split.iteritems():
-            synt_ll[i] = {}
-            
-            for j in data.unique_argnums:                
-                synt_synt_sum = T.sum(data.other_positions[j][:,None,:]*synt_synt[None,:,:], axis=2)
+        for i, outer_partition in self.data.iteritems():            
+            for j, inner_partition in outer_partition.iteritems():                
+                synt_synt_sum = T.sum(self.data.gramfunc_global[j][:,None,:]*synt_synt[None,:,:], axis=2)
                 synt_potential = synt_synt_sum[:,:,None]+role_synt[None,:,:]
 
                 synt_potential_exp = T.exp(synt_potential)
                 synt_prob = synt_potential_exp / T.sum(synt_potential_exp, axis=1)[:,None,:]
                 
 
-                synt_ll[i][j] = synt_prob[T.arange(data.data[j].shape[0])[:,None,None],
-                                          data.gramfuncud[j][:,None,None],
-                                          data.position_role_map[j][data.argposrel[j]]]
-                synt_ll[i][j] = synt_ll[i][j] - T.log(float(self.num_of_properties))
+                synt_ll[i][j] = synt_prob[T.arange(inner_partition.shape[0])[:,None,None],
+                                          self.data.gramfunc[j][:,None,None],
+                                          self.position_role_map[i][j][self.data.argposrel[i][j]]]
+                synt_ll[i][j] = synt_ll[i][j] - T.log(float(self.data.nproperties))
  
         self._synt_ll = synt_ll
 
