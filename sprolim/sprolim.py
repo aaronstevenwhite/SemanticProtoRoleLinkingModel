@@ -98,55 +98,56 @@ class Sprolim(object):
     def _initialize_canonicalization(self):
         canon_ll = defaultdict(dict)
         
-        for i, data in self.data_split.iteritems():            
-            for j in data.unique_argnums:
-                # canonicalization_prob_aux = np.random.normal(0., 1., [data.num_of_rolesets[j],
-                #                                                       data.num_of_ltr_perms[j]])
-
-                canonicalization_prob_aux = np.tile(1./np.arange(1, data.num_of_ltr_perms[j]+1),
-                                                    [data.num_of_rolesets[j], 1])
+        for i, outer_partition in self.data.predicatetokenindices.iteritems():
+            for j, inner_partition in outer_partition.iteritems():
+                canonicalization_prob_aux = np.tile(1./np.arange(1, self.nltrperms[i][j]+1),
+                                                    [self.data.npredicates[i][j], 1])
                 
                 self._representations['canonicalization_'+str(i)+str(j)] = theano.shared(canonicalization_prob_aux,
-                                                                                name='canonicalization_prob'+str(i)+str(j)+self.ident)
+                                                                                         name='canonicalization_prob'+\
+                                                                                              str(i)+str(j)+self.ident)
 
                 canonicalization_exp = T.exp(self._representations['canonicalization_'+str(i)+str(j)])
                 canonicalization_prob = canonicalization_exp / T.sum(canonicalization_exp, axis=1)[:,None]
-                canonicalization_logprob = T.log(canonicalization_prob)[data.rolesettokenindices[j]]
+                canonicalization_logprob = T.log(canonicalization_prob)[inner_partition]
 
-                canon_ll[i][j] = canonicalization_logprob[data.sentroleset[j],None,:] - T.log(j)
+                canon_ll[i][j] = canonicalization_logprob[self.data.sentpredicate[i][j],None,:] - T.log(j)
             
         self._canonicalization_ll = canon_ll
 
     def _initialize_applicability(self):
-        if self.initialized_model is None:
-            #appl_aux = np.random.normal(0, 1, size=[self.nprotoroles, self.num_of_properties, 2])
-            appl_aux = np.zeros([self.nprotoroles, self.num_of_properties, 2])
-        else:
-            appl_aux = self.initialized_model.representations['applicable'].eval()
+        # if self.initialized_model is None:
+        #     #appl_aux = np.random.normal(0, 1, size=[self.nprotoroles, self.num_of_properties, 2])
+        #     appl_aux = np.zeros([self.nprotoroles, self.num_of_properties, 2])
+        # else:
+        #     appl_aux = self.initialized_model.representations['applicable'].eval()
 
+        appl_aux = np.zeros([self.nprotoroles, self.data.nproperties, 2])
+            
         self._representations['applicable'] = theano.shared(appl_aux, name='appl'+self.ident)
 
         appl_exp = T.exp(self._representations['applicable'])
         appl_prob = appl_exp / T.sum(appl_exp, axis=2)[:,:,None]
 
-        appl_ll = {}
+        appl_ll = defaultdict(dict)
         
         for i, data in self.data_split.iteritems():
-            appl_ll[i] = {}
             for j in data.unique_argnums:
-                appl_ll[i][j] = T.log(appl_prob[data.position_role_map[j][data.argposrel[j]],
-                                             data.property[j][:,None,None],
-                                             data.applicable[j][:,None,None]])
+                appl_ll[i][j] = T.log(appl_prob[self.position_role_map[i][j][self.data.argposrel[i][j]],
+                                                self.data.property[i][j][:,None,None],
+                                                self.data.applicable[i][j][:,None,None]])
 
         self._appl_ll = appl_ll
 
     def _initialize_rating(self):
-        if self.initialized_model is None:
-            #rating_aux = np.random.normal(0, 1, size=[self.nprotoroles, self.num_of_properties])
-            rating_aux = np.zeros([self.nprotoroles, self.num_of_properties])
-        else:
-            rating_aux = self.initialized_model.representations['rating'].eval()
+        # if self.initialized_model is None:
+        #     #rating_aux = np.random.normal(0, 1, size=[self.nprotoroles, self.num_of_properties])
+        #     rating_aux = np.zeros([self.nprotoroles, self.num_of_properties])
+        # else:
+        #     rating_aux = self.initialized_model.representations['rating'].eval()
 
+        rating_aux = np.zeros([self.nprotoroles, self.num_of_properties])
+            
         self._representations['rating'] = theano.shared(rating_aux, name='rating'+self.ident)
 
         if self.initialized_model is None:
