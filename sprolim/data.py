@@ -24,7 +24,8 @@ class SprolimData(object):
         Parameters
         ----------
         data : pandas.DataFrame
-            A dataframe containing the following columns: 
+            A dataframe containing the following columns:
+            - annotatorid (optional)
             - sentenceid
             - predicate
             - predpos
@@ -58,13 +59,22 @@ class SprolimData(object):
 
     def _extract_data_attrs(self):
         self._nproperties = self._data.property.unique().shape[0]
+        self._nresponsetypes = (self._data.response-self._data.response.min()).max() + 1
         self._ngramfuncs = get_num_of_types(self._data.gramfunc)
 
+        if 'annotatorid' in self._data.columns:
+            self._data['annotatorid'] = get_codes(self._data['annotatorid'])
+            self._nannotators = self._data.annotatorid.max() + 1
+        else:
+            self._data['annotatorid'] = 0
+            self._nannotators = 1
+            
     def _extract_predicate_list(self):
         predicates = self._data.predicate.astype('category')
         self._predicate_list = np.array(predicates.cat.categories)
 
-        self._ycats = np.array(self._data.gramfunc.unique())
+        gramfunc = self._data.gramfunc.astype('category')
+        self._ycats = np.array(gramfunc.cat.categories)
         
     def _append_argument_info(self):
 
@@ -108,26 +118,34 @@ class SprolimData(object):
                                   for i, cell in partition.iteritems()}
 
     def _create_predicate_token_indices(self):
-        self._predicatetokenindices = defaultdict(dict)
+        self.predicatetypeindices = defaultdict(dict)
+        self.predicatetokenindices = defaultdict(dict)
         
         for i, outer_partition in self._data_partitioned.iteritems():
             for j, inner_partition in outer_partition.iteritems():
                 unique_sentpredicates = inner_partition.sentpredicate.astype('category').cat.categories
                 predicate_tokens = unique_sentpredicates.map(lambda x: x.split(':')[1])
-            
-                self._predicatetokenindices[i][j] = np.array(get_codes(pd.Series(predicate_tokens)))
 
-    def _wrap_in_shared(self, i, j, colname, cats=None):
-        return theano.shared(np.array(get_codes(self._data_partitioned[i][j][colname], cats)),
+                self.predicatetypeindices[i][j] = np.array(get_codes(pd.Series(predicate_tokens),
+                                                                     cats=self._predicate_list))
+                self.predicatetokenindices[i][j] = np.array(get_codes(pd.Series(predicate_tokens)))
+
+    def _wrap_in_shared(self, i, j, colname, cats=None, convert=True):
+        if convert:
+            codes = np.array(get_codes(self._data_partitioned[i][j][colname], cats))
+        else:
+            codes = np.array(self._data_partitioned[i][j][colname])
+            
+        return theano.shared(codes,
                              name=colname+str(i)+str(j)+self._ident)
             
     def _create_shared_variables(self):
 
         heads = ['sentenceid', 'predicate', 'argposrel', 'predicatearg',
                  'sentpredicate', 'sentpredicatearg', 'property', 'gramfunc',
-                 'applicable', 'response']
-
-        self.gramfunc = defaultdict(dict)
+                 'applicable', 'response', 'annotatorid']
+        
+        self.gramfunc_global = defaultdict(dict)
         
         for h in heads:
             self.__dict__[h] = defaultdict(dict)
@@ -135,11 +153,13 @@ class SprolimData(object):
             for i, outer_partition in self._data_partitioned.iteritems():
                 for j, inner_partition in outer_partition.iteritems():
 
-                    self.gramfunc[i][j] = theano.shared(np.array(inner_partition[self._ycats]),
+                    self.gramfunc_global[i][j] = theano.shared(np.array(inner_partition[self._ycats]),
                                                                  name='syntax'+str(i)+str(j)+self._ident)
 
-                    if h=='predicate':
-                        self.__dict__[h][i][j] = self._wrap_in_shared(i, j, h, self._predicate_list)
+                    if h == 'predicate':
+                        self.__dict__[h][i][j] = self._wrap_in_shared(i, j, h, cats=self._predicate_list)
+                    elif h == 'annotatorid':
+                        self.__dict__[h][i][j] = self._wrap_in_shared(i, j, h, convert=False)
                     else:
                         self.__dict__[h][i][j] = self._wrap_in_shared(i, j, h)
 
@@ -153,7 +173,7 @@ class SprolimData(object):
                                                   name='nsentsperpredicate'+self._ident)
 
         self.nsentences = defaultdict(dict)
-        self.nproperties = defaultdict(dict)
+        #self.nproperties = defaultdict(dict)
         self.npredicates = defaultdict(dict)
         self.npredicatetokens = defaultdict(dict)
         self.nargtokens = defaultdict(dict)
@@ -163,11 +183,14 @@ class SprolimData(object):
                 d = self._data_partitioned[i][j]
                 
                 self.nsentences[i][j] = get_num_of_types(d.sentenceid)
-                self.nproperties[i][j] = get_num_of_types(d.property)
+                #self.nproperties[i][j] = get_num_of_types(d.property)
                 self.npredicates[i][j] = get_num_of_types(d.predicate)
                 self.npredicatetokens[i][j] = get_num_of_types(d.sentpredicate)
                 self.nargtokens[i][j] = get_num_of_types(d.sentpredicatearg)
 
+    def iteritems(self):
+        return self._data_partitioned.iteritems()
+                
     @property
     def data(self):
         return self._data_partitioned
@@ -176,9 +199,27 @@ class SprolimData(object):
     def ngramfuncs(self):
         return self._ngramfuncs
 
+    @property
+    def nresponsetypes(self):
+        return self._nresponsetypes
     
-if __name__ == '__main__':
-    d = pd.read_csv('../bin/data.tmp')
+    @property
+    def nproperties(self):
+        return self._nproperties
+
+    @property
+    def nannotators(self):
+        return self._nannotators
+
+    @property
+    def rawdata(self):
+        return self._data
+
+    def levels(self, col):
+        return self._data[col].astype('category').cat.categories
+
+def main():
+    d1 = pd.read_csv('../bin/data.tmp')
     
     # d = pd.concat([pd.read_csv('protoroles_eng_pb_08302015.tsv', sep='\t'),
     #                pd.read_csv('ud_info.tsv', sep='\t')],
@@ -190,12 +231,41 @@ if __name__ == '__main__':
     # d['applicable'] = d['applicable'].astype(int)
     # d['argposud'] = d['argposud'].map(lambda x: x.split(',')[0]).astype(int)
 
-    d = d[['sentenceid', 'roleset', 'predtokenud', 'argposud', 'gramfuncud',
-           'property', 'response', 'applicable']]
+    d1 = d1[['sentenceid', 'roleset', 'predtokenud', 'argposud', 'gramfuncud',
+             'property', 'response', 'applicable']]
     
-    d = d.rename(columns={'roleset': 'predicate',
-                          'argposud': 'argpos',
-                          'predtokenud': 'predpos',
-                          'gramfuncud': 'gramfunc'})
+    d1 = d1.rename(columns={'roleset': 'predicate',
+                            'argposud': 'argpos',
+                            'predtokenud': 'predpos',
+                            'gramfuncud': 'gramfunc'})
+
+    d1['predicate'] = d1['predicate'].map(lambda x: x.split('.')[0])
     
-    sd = SprolimData(d)
+    d2 = pd.read_csv('../bin/protoroles_eng_ud1.2_11082016.tsv', sep='\t')
+
+    d2 = d2.rename(columns=lambda x: x.replace('.', '').lower())
+    
+    d2 = d2[~d2.response.isnull()]
+    
+    d2['response'] = d2['response'].astype(int)
+    d2['applicable'] = (d2['applicable']=='yes').astype(int)
+    d2['gramfunc'] = d2['gramfunc'].map(lambda x: {'nsubj': 'subject',
+                                                   'nsubjpass': 'subject',
+                                                   'dobj': 'object',
+                                                   'iobj': 'object'}[x])
+    
+    d2 = d2.rename(columns={'predlemma': 'predicate',
+                            'argtokensbegin': 'argpos',
+                            'predtoken': 'predpos'})
+
+    
+    d1['annotatorid'] = d2[d2.dataset=='pilot1'].annotatorid.unique()[0]
+    
+    d2 = d2[d1.columns]
+
+    d = pd.concat([d1, d2])
+    
+    return SprolimData(d)
+    
+if __name__ == '__main__':
+    sd = main()

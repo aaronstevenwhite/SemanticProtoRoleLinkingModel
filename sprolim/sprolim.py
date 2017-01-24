@@ -6,6 +6,7 @@ import pandas as pd
 import theano
 import theano.tensor as T
 
+from collections import defaultdict
 from itertools import combinations, combinations_with_replacement, permutations
 from scipy.misc import logsumexp
 from sklearn.linear_model import LogisticRegression
@@ -13,7 +14,7 @@ from sklearn.metrics import confusion_matrix, f1_score, precision_recall_fscore_
 from sklearn.cross_validation import LabelKFold, train_test_split
 
 from utility import *
-from data import Data
+# from data import SprolimData
 
 import matplotlib.pyplot as plt
 
@@ -24,15 +25,24 @@ warnings.simplefilter(action = "ignore")
 
 class Sprolim(object):
     
-    def __init__(self, nprotoroles=2):
+    def __init__(self, nprotoroles=2, nverbdims=None, nverbsenses=None, orthogonalize=True):
         '''
         Parameters
         ----------
         nprotoroles : int
             the number of protoroles the model assumes
+        nverbdims : int or NoneType
+            the number of dimensions for the verb embeddings
+        nverbsenses : int or NoneType
+            the number of verb embeddings per verb type
+        orthoganlize : bool
+            whether to orthogonalize the verb embeddings
         '''
 
         self.nprotoroles = nprotoroles
+        self.nverbdims = nverbdims
+        self.orthoganlize = orthogonalize
+        self.nverbsenses = nverbsenses if nverbsenses is not None else 1
         
         self._ident = ''.join([str(i) for i in np.random.choice(9, size=10)])
         
@@ -52,10 +62,10 @@ class Sprolim(object):
         
     def _initialize_maps(self):
         self.role_perms = {}
-        self.ltr_perms = default(dict)
-        self.position_role_map = default(dict)
+        self.ltr_perms = defaultdict(dict)
+        self.position_role_map = defaultdict(dict)
 
-        self.nltrperms = default(dict)
+        self.nltrperms = defaultdict(dict)
 
         for i, outer_partition in self.data.iteritems():
             role_combs = list(combinations_with_replacement(range(self.nprotoroles), i))
@@ -73,14 +83,31 @@ class Sprolim(object):
         
     def _initialize_mixture(self):
         role_ll = defaultdict(dict)
+
+        if self.nverbdims is not None:
+            verbreps = np.random.normal(size=[self.data.npredicates_total, self.nverbdims])
+            self._representations['verbreps'] = theano.shared(verbreps, name='verbreps'+self._ident)
         
         for i, outer_partition in self.data.predicate.iteritems():
-            mixture_aux = np.zeros([self.data.npredicates_total, i, self.nprotoroles])
+            if self.nverbdims is None:
+                mixture_aux = np.zeros([self.data.npredicates_total, i, self.nprotoroles])
 
-            self._representations['mixture_'+str(i)] = theano.shared(mixture_aux,
-                                                                     name='mixture'+str(i)+self.ident)
+                self._representations['mixture_'+str(i)] = theano.shared(mixture_aux,
+                                                                         name='mixture'+str(i)+self._ident)
 
-            mixture_exp = T.exp(self._representations['mixture_'+str(i)])
+                mixraw = self._representations['mixture_'+str(i)]
+            else:
+                map_to_protorole = np.random.normal(size=[self.nverbdims, i, self.nprotoroles])
+
+                self._representations['map_to_protorole_'+str(i)] = theano.shared(map_to_protorole,
+                                                                         name='map_to_protorole'+str(i)+self._ident)
+
+                mixraw = T.tensordot(T.tanh(self._representations['verbreps']),
+                #mixraw = T.tensordot(self._representations['verbreps'],
+                                     self._representations['map_to_protorole_'+str(i)],
+                                     axes=1)
+
+            mixture_exp = T.exp(mixraw)
             mixture = mixture_exp / T.sum(mixture_exp, axis=2)[:,:,None]
 
             log_mixture = T.log(T.swapaxes(mixture, 0, 2))
@@ -93,24 +120,40 @@ class Sprolim(object):
                                 log_divisor[:,None]
                 
         self._role_ll = role_ll
-        # self._role_prior = (self.alpha - 1.)*T.sum(log_mixture)
+        self._role_prior = 0. #(self.alpha - 1.)*T.sum(log_mixture)
 
     def _initialize_canonicalization(self):
         canon_ll = defaultdict(dict)
         
         for i, outer_partition in self.data.predicatetokenindices.iteritems():
             for j, inner_partition in outer_partition.iteritems():
+                # if self.nverbdims is None:
                 canonicalization_prob_aux = np.tile(1./np.arange(1, self.nltrperms[i][j]+1),
                                                     [self.data.npredicates[i][j], 1])
-                
+
                 self._representations['canonicalization_'+str(i)+str(j)] = theano.shared(canonicalization_prob_aux,
                                                                                          name='canonicalization_prob'+\
-                                                                                              str(i)+str(j)+self.ident)
+                                                                                              str(i)+str(j)+self._ident)
 
                 canonicalization_exp = T.exp(self._representations['canonicalization_'+str(i)+str(j)])
                 canonicalization_prob = canonicalization_exp / T.sum(canonicalization_exp, axis=1)[:,None]
                 canonicalization_logprob = T.log(canonicalization_prob)[inner_partition]
 
+                # else:
+                #     canonicalization_map = np.random.normal(size=[self.nverbdims, self.nltrperms[i][j]+1])
+
+                #     self._representations['canonicalization_map_'+str(i)+str(j)] = theano.shared(canonicalization_map,
+                #                                                                              name='canonicalization_map'+\
+                #                                                                                   str(i)+str(j)+self._ident)
+
+                #     canonraw = T.dot(T.tanh(self._representations['verbreps']),
+                #                      self._representations['canonicalization_map_'+str(i)+str(j)])
+                    
+
+                #     canonicalization_exp = T.exp(canonraw)
+                #     canonicalization_prob = canonicalization_exp / T.sum(canonicalization_exp, axis=1)[:,None]
+                #     canonicalization_logprob = T.log(canonicalization_prob)[self.data.predicatetypeindices[i][j]]
+                    
                 canon_ll[i][j] = canonicalization_logprob[self.data.sentpredicate[i][j],None,:] - T.log(j)
             
         self._canonicalization_ll = canon_ll
@@ -123,17 +166,23 @@ class Sprolim(object):
         #     appl_aux = self.initialized_model.representations['applicable'].eval()
 
         appl_aux = np.zeros([self.nprotoroles, self.data.nproperties, 2])
-            
-        self._representations['applicable'] = theano.shared(appl_aux, name='appl'+self.ident)
+        
+        self._representations['applicable'] = theano.shared(appl_aux, name='appl'+self._ident)
 
-        appl_exp = T.exp(self._representations['applicable'])
-        appl_prob = appl_exp / T.sum(appl_exp, axis=2)[:,:,None]
+        weights_appl_aux = np.zeros([self.data.nannotators, 2])
+
+        self._representations['appl_weights'] = theano.shared(weights_appl_aux, name='appl_weights'+self._ident)
+        
+        appl_uprob = T.exp(self._representations['applicable'][None,:,:,:] +\
+                           self._representations['appl_weights'][:,None,None,:])
+        appl_prob = appl_uprob / T.sum(appl_uprob, axis=3)[:,:,:,None]
 
         appl_ll = defaultdict(dict)
         
-        for i, data in self.data_split.iteritems():
-            for j in data.unique_argnums:
-                appl_ll[i][j] = T.log(appl_prob[self.position_role_map[i][j][self.data.argposrel[i][j]],
+        for i, outer_partition in self.data.iteritems():
+            for j, inner_partition in outer_partition.iteritems():
+                appl_ll[i][j] = T.log(appl_prob[self.data.annotatorid[i][j][:,None,None],
+                                                self.position_role_map[i][j][self.data.argposrel[i][j]],
                                                 self.data.property[i][j][:,None,None],
                                                 self.data.applicable[i][j][:,None,None]])
 
@@ -148,82 +197,36 @@ class Sprolim(object):
 
         rating_aux = np.zeros([self.nprotoroles, self.data.nproperties])
             
-        self._representations['rating'] = theano.shared(rating_aux, name='rating'+self.ident)
+        self._representations['rating'] = theano.shared(rating_aux, name='rating'+self._ident)
 
         # if self.initialized_model is None:
         #     jumps_aux = np.array([-np.inf] + [1]*(np.max(self.data.response)-1) + [-np.inf])
         # else:
         #     jumps_aux = self.initialized_model.representations['jumps'].eval()
 
-        jumps_aux = np.array([-np.inf] + [1]*(np.max(self.data.response)-1) + [-np.inf])
-
+        weights_add = np.zeros([self.data.nannotators, self.data.nresponsetypes])
+        #weights_mult = np.zeros([self.data.nannotators, np.max(self.data.response)+1])
         
-        self._representations['jumps'] = theano.shared(jumps_aux, name='jumps'+self.ident)
+        self._representations['rating_weights_add'] = theano.shared(weights_add, name='rating_weights_add'+self._ident)
+        #self._representations['rating_weights_mlt'] = theano.shared(weights, name='rating_weights_mult'+self._ident)
 
-        jumps = T.exp(self._representations['jumps'])
-        cuts = T.extra_ops.cumsum(jumps)
-        cuts_centered = cuts - cuts[(np.max(self.data.response)-1)/2]
-
-        rating_logprob_cum = cuts_centered[None,None,:] - self._representations['rating'][:,:,None]
-
-
-        rating_prob_cum = (1. / (1. + T.exp(-rating_logprob_cum)))
-
-        rate_ll = {}
+        #wmcum = T.extra_ops.cumsum(T.square(self._representations['rating_weights_mlt']), axis=1)[:,None,None,:]
+        wmcum = (np.arange(self.data.nresponsetypes)+1.)[None,None,None,:]
         
-        for i, data in self.data_split.iteritems():
-            rate_ll[i] = {}
-            for j in data.unique_argnums:
-                rate_prob_cum_high = rating_prob_cum[data.position_role_map[j][data.argposrel[j]],
-                                                     data.property[j][:,None,None],
-                                                     data.response[j][:,None,None]]
-                rate_prob_cum_low = rating_prob_cum[data.position_role_map[j][data.argposrel[j]],
-                                                    data.property[j][:,None,None],
-                                                    data.response[j][:,None,None]-1]
-
-                rate_prob_high = T.switch(T.lt(T.tile(data.response[j][:,None,None],
-                                                      [1,data.role_perms.shape[0],
-                                                       data.num_of_ltr_perms[j]]),
-                                               self.data.response.max()),
-                                          rate_prob_cum_high,
-                                          T.ones_like(rate_prob_cum_high))
-
-                rate_prob_low = T.switch(T.gt(T.tile(data.response[j][:,None,None],
-                                                     [1,data.role_perms.shape[0],
-                                                      data.num_of_ltr_perms[j]]),
-                                              self.data.response.min()),
-                                         rate_prob_cum_low,
-                                         T.zeros_like(rate_prob_cum_high))
-
-                rate_prob = rate_prob_high - rate_prob_low
-
-                rate_ll[i][j] = data.applicable[j][:,None,None]*T.log(rate_prob)
-
-        cuts = self._initialize_cutpoints()
-        #scale = self._initialize_scale()[:,None]
-
-        ll = 0.
+        rate_uprob = T.exp(wmcum*self._representations['rating'][None,:,:,None] +\
+                           self._representations['rating_weights_add'][:,None,None,:])
+        rate_prob = rate_uprob / T.sum(rate_uprob, axis=3)[:,:,:,None]
         
-        for i in np.unique(self._response):
-            annotator_idx = self._annotator_codes[i]
-            fixed_idx = self._fixed_codes[i]
+        rate_ll = defaultdict(dict)
 
-            if i < self._max_response:
-                upper = cuts[annotator_idx, i] - self._normalized[fixed_idx]
-                upper_cumprob = logisticT(upper)#/scale)
-            else:
-                upper_cumprob = 1.
+        for i, outer_partition in self.data.iteritems():
+            for j, inner_partition in outer_partition.iteritems():
+                rate_ll[i][j] = T.log(rate_prob[self.data.annotatorid[i][j][:,None,None],
+                                                self.position_role_map[i][j][self.data.argposrel[i][j]],
+                                                self.data.property[i][j][:,None,None],
+                                                self.data.response[i][j][:,None,None]])
 
-            if i > 0:
-                lower = cuts[annotator_idx, i-1] - self._normalized[fixed_idx]
-                lower_cumprob = logisticT(lower)#/scale)
-            else:
-                lower_cumprob = 0.
-
-            ll += T.sum(T.log(upper_cumprob-lower_cumprob+1e-20))
-
-                
-        self._rate_ll = rate_ll
+        self._rating_ll = rate_ll
     
     def _initialize_syntax(self):
         # if self.initialized_model is None:
@@ -237,53 +240,52 @@ class Sprolim(object):
         #     role_synt_aux = self.initialized_model.representations['role_syntax'].eval()
         #     synt_synt_aux = self.initialized_model.representations['syntax_syntax'].eval()
 
-        role_synt_aux = np.random.normal(0., 1., size=[self.num_of_syntpos,self.nprotoroles])
+        role_synt_aux = np.random.normal(0., 1., size=[self.data.ngramfuncs, self.nprotoroles])
         synt_synt_aux = LogisticRegression(fit_intercept=False,
                                            multi_class='multinomial',
-                                           solver='newton-cg').fit(self.data.gramfunc_global,
-                                                                   self.data.gramfunc).coef_
+                                           solver='newton-cg').fit(self.data.rawdata[self.data.levels('gramfunc')],
+                                                                   self.data.rawdata.gramfunc).coef_
   
-        self._representations['role_syntax'] = theano.shared(role_synt_aux, name='role_synt'+self.ident)
+        self._representations['role_syntax'] = theano.shared(role_synt_aux, name='role_synt'+self._ident)
         role_synt = self._representations['role_syntax']
 
-        self._representations['syntax_syntax'] = theano.shared(synt_synt_aux, name='synt_synt'+self.ident)
+        self._representations['syntax_syntax'] = theano.shared(synt_synt_aux, name='synt_synt'+self._ident)
         synt_synt = self._representations['syntax_syntax']
 
         synt_ll = defaultdict(dict)
         
         for i, outer_partition in self.data.iteritems():            
             for j, inner_partition in outer_partition.iteritems():                
-                synt_synt_sum = T.sum(self.data.gramfunc_global[j][:,None,:]*synt_synt[None,:,:], axis=2)
+                synt_synt_sum = T.sum(self.data.gramfunc_global[i][j][:,None,:]*synt_synt[None,:,:], axis=2)
                 synt_potential = synt_synt_sum[:,:,None]+role_synt[None,:,:]
 
                 synt_potential_exp = T.exp(synt_potential)
                 synt_prob = synt_potential_exp / T.sum(synt_potential_exp, axis=1)[:,None,:]
                 
 
-                synt_ll[i][j] = synt_prob[T.arange(inner_partition.shape[0])[:,None,None],
-                                          self.data.gramfunc[j][:,None,None],
-                                          self.position_role_map[i][j][self.data.argposrel[i][j]]]
+                synt_ll[i][j] = T.log(synt_prob[T.arange(inner_partition.shape[0])[:,None,None],
+                                                self.data.gramfunc[i][j][:,None,None],
+                                                self.position_role_map[i][j][self.data.argposrel[i][j]]])
                 synt_ll[i][j] = synt_ll[i][j] - T.log(float(self.data.nproperties))
  
-        self._synt_ll = synt_ll
+        self._syntax_ll = synt_ll
 
     def _initialize_loss(self):
         self._total_loglike_sum = 0.
         self._total_loglike_sum_synt_only = 0.
 
-        self._role_perm = {}
+        self._role_perm = defaultdict(dict)
         
-        for i, data in self.data_split.iteritems():
-            self._role_perm[i] = {}
-            
-            for j in data.unique_argnums:
+        for i, outer_partition in self.data.iteritems():
+            for j, inner_partition in outer_partition.iteritems():
                 ## likelihood
                 inner_sum = self._canonicalization_ll[i][j]+\
                             self._appl_ll[i][j]+\
                             self._rating_ll[i][j]
                 
-                if not self.semantics_only:
-                    inner_sum += self._syntax_ll[i][j]
+                # if not self.semantics_only:
+                #     inner_sum += self._syntax_ll[i][j]
+                inner_sum += self._syntax_ll[i][j]
 
                 self._role_perm[i][j] = self._role_ll[i][j][:,:,None] + inner_sum
                     
@@ -300,8 +302,12 @@ class Sprolim(object):
                                                                             perm_ll_synt_only),
                                                                       axis=1)))
                 
-        self._total_loglike_sum += self._role_prior_ll
+        self._total_loglike_sum += self._role_prior
 
+        if self.orthoganlize:
+            verbrep2 = T.dot(T.tanh(self._representations['verbreps']).T, T.tanh(self._representations['verbreps']))
+            verbrep2_rawsum = T.sum(T.square(verbrep2 - verbrep2*T.identity_like(verbrep2)))
+            self._total_loglike_sum += -1e7*verbrep2_rawsum/(self.nverbdims**2*self.data.npredicates_total**2)
 
     def _initialize_updaters(self, fix_params):
         update_dict_gd = []
@@ -314,17 +320,17 @@ class Sprolim(object):
                 rep_grad = T.grad(self._total_loglike_sum, rep)
 
                 # if self.initialized_model is None or name.split('_')[0] in ['canonicalization', 'mixture']:
-                self.rep_grad_hist_t[name] = theano.shared(np.ones(rep.shape.eval()), name=name+'_hist'+self.ident)
+                self.rep_grad_hist_t[name] = theano.shared(np.ones(rep.shape.eval()), name=name+'_hist'+self._ident)
                 # else:
                 #     self.rep_grad_hist_t[name] = theano.shared(self.initialized_model.rep_grad_hist_t[name].eval(),
-                #                                                name=name+'_hist'+self.ident)
+                #                                                name=name+'_hist'+self._ident)
 
                 rep_grad_adj = rep_grad / (T.sqrt(self.rep_grad_hist_t[name]))
                 
-                if name == 'jumps':
-                    learning_rate = 0.000001
-                else:
-                    learning_rate = 0.00001
+                # if name == 'jumps':
+                #     learning_rate = 0.000001
+                # else:
+                learning_rate = 0.00001
 
                 update_dict_gd += [(self.rep_grad_hist_t[name], self.rep_grad_hist_t[name] + T.power(rep_grad, 2)),
                                     (rep, rep + learning_rate*rep_grad)]
@@ -335,16 +341,16 @@ class Sprolim(object):
                                           outputs=[self._total_loglike_sum,
                                                    self._total_loglike_sum_synt_only],
                                           updates=update_dict_gd,
-                                          name='updater_gd_'+self.ident)
+                                          name='updater_gd_'+self._ident)
 
         self.updater_ada = theano.function(inputs=[],
                                            outputs=[self._total_loglike_sum,
                                                     self._total_loglike_sum_synt_only],
                                            updates=update_dict_ada,
-                                           name='updater_ada'+self.ident)
+                                           name='updater_ada'+self._ident)
 
 
-    def fit(self, data, iterations=1000, tolerance=1., gd_init=True, fix_params=False, verbose=False):
+    def fit(self, data, iterations=1000, tolerance=-np.inf, gd_init=20, fix_params=False, verbose=False):
         '''
         Parameters
         ----------
@@ -353,7 +359,7 @@ class Sprolim(object):
 
         iterations : int        
         tolerance : float
-        gd_init : bool
+        gd_init : int
         fix_params : bool
         verbose : bool
         '''
@@ -367,7 +373,7 @@ class Sprolim(object):
         prev_ll = -np.inf
         
         for i in range(iterations):
-            if i < 5 and gd_init:
+            if i < gd_init:
                 self.ll, self.ll_synt_only = self.updater_gd()
             else:
                 self.ll, self.ll_synt_only = self.updater_ada()
@@ -476,24 +482,27 @@ class Sprolim(object):
     @property
     def rating(self):
         return pd.DataFrame(np.transpose(self._representations['rating'].eval()),
-                            index=self.data.property.astype('category').cat.categories)
+                            index=self.data.levels('property'))
 
     @property
     def applicable(self):
         appl_exp = T.exp(self._representations['applicable'])
-        appl = (appl_exp / T.sum(appl_exp, axis=2)[:,:,None])
-
+        appl = appl_exp / T.sum(appl_exp, axis=2)[:,:,None]
+        
         return pd.DataFrame(np.transpose(appl[:,:,1].eval()),
-                            index=self.data.property.astype('category').cat.categories)
+                            index=self.data.levels('property'))
 
     @property
     def role_syntax(self):
         return pd.DataFrame(self._representations['role_syntax'].eval(),
-                            columns=['role'+str(i) for i in range(self.nprotoroles)], index=self.ycats)
+                            columns=['role'+str(i) for i in range(self.nprotoroles)],
+                            index=self.data.levels('gramfunc'))
 
     @property
     def syntax_syntax(self):
-        return pd.DataFrame(self._representations['syntax_syntax'].eval(), index=self.ycats, columns=self.ycats)
+        return pd.DataFrame(self._representations['syntax_syntax'].eval(),
+                            index=self.data.levels('gramfunc'),
+                            columns=self.data.levels('gramfunc'))
 
     def predict_ltr(self, maximize=False):
 
@@ -682,3 +691,10 @@ class Sprolim(object):
         self.metrics.to_csv(name('metrics')+str(self.nprotoroles)+'.csv')
         self.prediction.to_csv(name('prediction')+str(self.nprotoroles)+'.csv')
         self.confusion.to_csv(name('confusion')+str(self.nprotoroles)+'.csv')
+
+if __name__ == '__main__':
+    from data import main, SprolimData
+    sd = main()
+
+    m = Sprolim(nverbdims=2)
+    m.fit(sd, verbose=True)
