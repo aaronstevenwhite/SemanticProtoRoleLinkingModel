@@ -1,7 +1,7 @@
 from setuptools import setup
 
-setup(name='SPROLIM',
-      version='1.1dev0',
+setup(name='SemanticProtoRoleLinkingModel',
+      version='0.1dev0',
       description='Semantic Proto-Role Linking Model',
       url='https://github.com/aaronstevenwhite/SemanticProtoRoleLinkingModel',
       author='Aaron Steven White',

@@ -25,7 +25,7 @@ warnings.simplefilter(action = "ignore")
 
 class Sprolim(object):
     
-    def __init__(self, nprotoroles=2, nverbdims=None, nverbsenses=None, orthogonalize=True):
+    def __init__(self, nprotoroles=2, nverbdims=None, npredicatesenses=None, concentration=(1.,1.), orthogonalize=True):
         '''
         Parameters
         ----------
@@ -33,16 +33,19 @@ class Sprolim(object):
             the number of protoroles the model assumes
         nverbdims : int or NoneType
             the number of dimensions for the verb embeddings
-        nverbsenses : int or NoneType
+        npredicatesenses : int or NoneType
             the number of verb embeddings per verb type
+        concentration : tuple of ints
+            concentration parameters for the HDP
         orthoganlize : bool
             whether to orthogonalize the verb embeddings
         '''
 
         self.nprotoroles = nprotoroles
         self.nverbdims = nverbdims
-        self.orthoganlize = orthogonalize
-        self.nverbsenses = nverbsenses if nverbsenses is not None else 1
+        self.orthogonalize = orthogonalize
+        self.npredicatesenses = npredicatesenses
+        self._gamma, self._alpha  = concentration
         
         self._ident = ''.join([str(i) for i in np.random.choice(9, size=10)])
         
@@ -51,13 +54,16 @@ class Sprolim(object):
         self._initialize_maps()
         
         self._representations = {}
+
+        if self.npredicatesenses is not None:
+            self._initialize_sense()
         
         self._initialize_mixture()
         self._initialize_canonicalization()
         self._initialize_applicability()
         self._initialize_rating()
         self._initialize_syntax()
-
+        
         self._initialize_loss()
         
     def _initialize_maps(self):
@@ -80,17 +86,54 @@ class Sprolim(object):
 
                 self.nltrperms[i][j] = self.ltr_perms[i][j].shape[0]
 
+    def _initialize_sense(self):
+        betaprime_aux = np.zeros(self.npredicatesenses)
+        self._representations['betaprime'] = theano.shared(betaprime_aux,
+                                                           name='betaprime'+self._ident)
+        betaprime = T.nnet.sigmoid(self._representations['betaprime'])
+        beta = T.concatenate([betaprime, T.zeros(1)])*T.cumprod(1.-T.concatenate([T.zeros(1), betaprime]))
+
+        piprime_aux = np.zeros([self.data.npredicates_total, self.npredicatesenses])
+        self._representations['piprime'] = theano.shared(piprime_aux, name='piprime'+self._ident)
+        
+        piprime = T.nnet.sigmoid(self._representations['piprime'])
+        zeros = T.zeros([self.data.npredicates_total, 1])
+        pi = T.concatenate([piprime, zeros], axis=1)*T.cumprod(1.-T.concatenate([zeros, piprime], axis=1), axis=1)
+
+        upper_alpha = 1.
+        upper_beta = self._gamma
+        
+        upper_ll = T.sum((upper_alpha-1.)*T.log(betaprime) + (upper_beta-1.)*T.log(1.-betaprime))
+        
+        lower_alpha = self._alpha*beta[:-1]
+        lower_beta = self._alpha*(1.-beta[:-1])
+
+        lower_norm = T.gammaln(lower_alpha) + T.gammaln(lower_beta) - T.gammaln(lower_alpha+lower_beta)
+        
+        lower_ll = T.sum((lower_alpha-1.)*T.log(piprime) + (lower_beta-1.)*T.log(1.-piprime)-lower_norm)
+        
+        self._sense_prior = upper_ll + lower_ll 
+
+        self._sense_ll = T.log(pi[:,:-1])
+
         
     def _initialize_mixture(self):
         role_ll = defaultdict(dict)
 
         if self.nverbdims is not None:
-            verbreps = np.random.normal(size=[self.data.npredicates_total, self.nverbdims])
+            if self.npredicatesenses is None:
+                verbreps = np.random.normal(size=[self.data.npredicates_total, self.nverbdims])
+            else:
+                verbreps = np.random.normal(size=[self.data.npredicates_total, self.npredicatesenses, self.nverbdims])
+                
             self._representations['verbreps'] = theano.shared(verbreps, name='verbreps'+self._ident)
-        
+                
         for i, outer_partition in self.data.predicate.iteritems():
             if self.nverbdims is None:
-                mixture_aux = np.zeros([self.data.npredicates_total, i, self.nprotoroles])
+                if self.npredicatesenses is None:
+                    mixture_aux = np.zeros([self.data.npredicates_total, i, self.nprotoroles])
+                else:
+                    mixture_aux = np.zeros([self.data.npredicates_total, self.npredicatesenses, i, self.nprotoroles])
 
                 self._representations['mixture_'+str(i)] = theano.shared(mixture_aux,
                                                                          name='mixture'+str(i)+self._ident)
@@ -107,18 +150,25 @@ class Sprolim(object):
                                      self._representations['map_to_protorole_'+str(i)],
                                      axes=1)
 
+            repsize = 3 if self.npredicatesenses is None else 4
+                
             mixture_exp = T.exp(mixraw)
-            mixture = mixture_exp / T.sum(mixture_exp, axis=2)[:,:,None]
+            mixture = mixture_exp / T.sum(mixture_exp, axis=repsize-1).dimshuffle(range(repsize-1)+['x'])
 
-            log_mixture = T.log(T.swapaxes(mixture, 0, 2))
+            log_mixture = T.log(mixture.dimshuffle(range(repsize-1, -1, -1)))
 
             role_perms_logprob = T.sum(log_mixture[self.role_perms[i],T.arange(i)[None,:]], axis=1)
-            
+
             for j, inner_partition in outer_partition.iteritems():
                 log_divisor = T.log(self.data.nsents_per_predicate[inner_partition])
                 role_ll[i][j] = T.transpose(role_perms_logprob)[inner_partition] -\
-                                log_divisor[:,None]
-                
+                                log_divisor.dimshuffle([0]+['x']*(repsize-2))
+
+                if self.npredicatesenses is not None:
+                    sense_ll = self._sense_ll[inner_partition]# - log_divisor.dimshuffle([0]+['x']*(repsize-2))
+
+                    role_ll[i][j] += sense_ll[:,:,None]
+                    
         self._role_ll = role_ll
         self._role_prior = 0. #(self.alpha - 1.)*T.sum(log_mixture)
 
@@ -127,16 +177,22 @@ class Sprolim(object):
         
         for i, outer_partition in self.data.predicatetokenindices.iteritems():
             for j, inner_partition in outer_partition.iteritems():
-                # if self.nverbdims is None:
-                canonicalization_prob_aux = np.tile(1./np.arange(1, self.nltrperms[i][j]+1),
-                                                    [self.data.npredicates[i][j], 1])
-
+                if self.npredicatesenses is None:
+                    canonicalization_prob_aux = np.tile(1./np.arange(1, self.nltrperms[i][j]+1),
+                                                        [self.data.npredicates[i][j], 1])
+                else:
+                    canonicalization_prob_aux = np.tile(1./np.arange(1, self.nltrperms[i][j]+1),
+                                                        [self.data.npredicates[i][j], self.npredicatesenses, 1])
+                    
                 self._representations['canonicalization_'+str(i)+str(j)] = theano.shared(canonicalization_prob_aux,
                                                                                          name='canonicalization_prob'+\
                                                                                               str(i)+str(j)+self._ident)
 
+                repsize = 2 if self.npredicatesenses is None else 3
+                
                 canonicalization_exp = T.exp(self._representations['canonicalization_'+str(i)+str(j)])
-                canonicalization_prob = canonicalization_exp / T.sum(canonicalization_exp, axis=1)[:,None]
+                canonicalization_prob = canonicalization_exp /\
+                                        T.sum(canonicalization_exp, axis=repsize-1).dimshuffle(range(repsize-1)+['x'])
                 canonicalization_logprob = T.log(canonicalization_prob)[inner_partition]
 
                 # else:
@@ -154,7 +210,7 @@ class Sprolim(object):
                 #     canonicalization_prob = canonicalization_exp / T.sum(canonicalization_exp, axis=1)[:,None]
                 #     canonicalization_logprob = T.log(canonicalization_prob)[self.data.predicatetypeindices[i][j]]
                     
-                canon_ll[i][j] = canonicalization_logprob[self.data.sentpredicate[i][j],None,:] - T.log(j)
+                canon_ll[i][j] = canonicalization_logprob[self.data.sentpredicate[i][j]].dimshuffle(range(repsize-1)+['x', repsize-1]) - T.log(j)
             
         self._canonicalization_ll = canon_ll
 
@@ -185,6 +241,10 @@ class Sprolim(object):
                                                 self.position_role_map[i][j][self.data.argposrel[i][j]],
                                                 self.data.property[i][j][:,None,None],
                                                 self.data.applicable[i][j][:,None,None]])
+
+                if self.npredicatesenses is not None:
+                    appl_ll[i][j] = appl_ll[i][j][:,None,:,:]
+
 
         self._appl_ll = appl_ll
 
@@ -225,6 +285,9 @@ class Sprolim(object):
                                                 self.position_role_map[i][j][self.data.argposrel[i][j]],
                                                 self.data.property[i][j][:,None,None],
                                                 self.data.response[i][j][:,None,None]])
+
+                if self.npredicatesenses is not None:
+                    rate_ll[i][j] = rate_ll[i][j][:,None,:,:]
 
         self._rating_ll = rate_ll
     
@@ -267,14 +330,20 @@ class Sprolim(object):
                                                 self.data.gramfunc[i][j][:,None,None],
                                                 self.position_role_map[i][j][self.data.argposrel[i][j]]])
                 synt_ll[i][j] = synt_ll[i][j] - T.log(float(self.data.nproperties))
+
+                if self.npredicatesenses is not None:
+                    synt_ll[i][j] = synt_ll[i][j][:,None,:,:]
  
         self._syntax_ll = synt_ll
 
+        
     def _initialize_loss(self):
         self._total_loglike_sum = 0.
         self._total_loglike_sum_synt_only = 0.
 
         self._role_perm = defaultdict(dict)
+
+        repsize = 3 if self.npredicatesenses is None else 4
         
         for i, outer_partition in self.data.iteritems():
             for j, inner_partition in outer_partition.iteritems():
@@ -287,24 +356,30 @@ class Sprolim(object):
                 #     inner_sum += self._syntax_ll[i][j]
                 inner_sum += self._syntax_ll[i][j]
 
-                self._role_perm[i][j] = self._role_ll[i][j][:,:,None] + inner_sum
-                    
-                perm_ll = T.log(T.sum(T.exp(inner_sum), axis=2))
+                ## this is not part of the loss
+                self._role_perm[i][j] = self._role_ll[i][j].dimshuffle(range(repsize-1)+['x']) + inner_sum
                 
-                self._total_loglike_sum += T.sum(T.log(T.sum(T.exp(self._role_ll[i][j] +\
-                                                                   perm_ll),
-                                                            axis=1)))
-
-                inner_sum_synt_only = self._canonicalization_ll[i][j]+self._syntax_ll[i][j]
-                perm_ll_synt_only = T.log(T.sum(T.exp(inner_sum_synt_only), axis=2))
-
-                self._total_loglike_sum_synt_only += T.sum(T.log(T.sum(T.exp(self._role_ll[i][j] +\
-                                                                            perm_ll_synt_only),
-                                                                      axis=1)))
+                perm_ll = T.log(T.sum(T.exp(inner_sum), axis=repsize-1))
+                comb_ll = T.log(T.sum(T.exp(self._role_ll[i][j]+perm_ll), axis=repsize-2))
                 
-        self._total_loglike_sum += self._role_prior
+                if self.npredicatesenses is None:
+                    self._total_loglike_sum += T.sum(comb_ll)
+                else:
+                    sense_ll = T.log(T.sum(T.exp(comb_ll), axis=1))
+                    self._total_loglike_sum += T.sum(sense_ll)
 
-        if self.orthoganlize:
+                # inner_sum_synt_only = self._canonicalization_ll[i][j]+self._syntax_ll[i][j]
+                # perm_ll_synt_only = T.log(T.sum(T.exp(inner_sum_synt_only), axis=2))
+
+                # self._total_loglike_sum_synt_only += T.sum(T.log(T.sum(T.exp(self._role_ll[i][j] +\
+                #                                                             perm_ll_synt_only),
+                #                                                       axis=1)))
+                
+        self._total_loglike_sum += self._role_prior + self._sense_prior
+
+        self._total_loglike_sum.eval()
+        
+        if self.orthogonalize:
             verbrep2 = T.dot(T.tanh(self._representations['verbreps']).T, T.tanh(self._representations['verbreps']))
             verbrep2_rawsum = T.sum(T.square(verbrep2 - verbrep2*T.identity_like(verbrep2)))
             self._total_loglike_sum += -1e7*verbrep2_rawsum/(self.nverbdims**2*self.data.npredicates_total**2)
@@ -338,14 +413,14 @@ class Sprolim(object):
                                     (rep, rep + rep_grad_adj)]  
             
         self.updater_gd = theano.function(inputs=[],
-                                          outputs=[self._total_loglike_sum,
-                                                   self._total_loglike_sum_synt_only],
+                                          outputs=[self._total_loglike_sum],
+                                                   #self._total_loglike_sum_synt_only],
                                           updates=update_dict_gd,
                                           name='updater_gd_'+self._ident)
 
         self.updater_ada = theano.function(inputs=[],
-                                           outputs=[self._total_loglike_sum,
-                                                    self._total_loglike_sum_synt_only],
+                                           outputs=[self._total_loglike_sum],
+                                                    #self._total_loglike_sum_synt_only],
                                            updates=update_dict_ada,
                                            name='updater_ada'+self._ident)
 
@@ -374,15 +449,21 @@ class Sprolim(object):
         
         for i in range(iterations):
             if i < gd_init:
-                self.ll, self.ll_synt_only = self.updater_gd()
+                #self.ll, self.ll_synt_only = self.updater_gd()
+                self.ll = self.updater_gd()[0]
             else:
-                self.ll, self.ll_synt_only = self.updater_ada()
+                #self.ll, self.ll_synt_only = self.updater_ada()
+                self.ll = self.updater_ada()[0]
         
             if verbose:
-                print '{:<3d}\t{:08.2f}\t{:08.2f}'.format(int(i),
-                                                           float(self.ll),
-                                                           float(self.ll_synt_only))
+                # print '{:<3d}\t{:08.2f}\t{:08.2f}'.format(int(i),
+                #                                            float(self.ll),
+                #                                            float(self.ll_synt_only))
 
+                print '{:<3d}\t{:08.2f}'.format(int(i),
+                                                           float(self.ll))
+
+                
             if (self.ll - prev_ll) >= tolerance:
                 prev_ll = self.ll
             else:
@@ -696,5 +777,5 @@ if __name__ == '__main__':
     from data import main, SprolimData
     sd = main()
 
-    m = Sprolim(nverbdims=2)
+    m = Sprolim(nverbdims=2, npredicatesenses=5, orthogonalize=False, concentration=(0.1, 0.1))
     m.fit(sd, verbose=True)
