@@ -4,7 +4,7 @@
 
 This package implements the Semantic Proto-Role Linking Model (SPROLIM), which is described in:
 
-White, A. S., K. Rawlins, & B. Van Durme. (2017). [The Semantic Proto-Role Linking Model](http://aswhite.net/papers/white_semantic_2017.pdf). To appear in *Proceedings of 15th Conference of the European Chapter of the Association for Computational Linguistics*. Valencia, Spain. April 3-7, 2017.
+White, A. S., K. Rawlins, & B. Van Durme. (2017). [The Semantic Proto-Role Linking Model](http://aclweb.org/anthology/E/E17/E17-2015.pdf). To appear in *Proceedings of 15th Conference of the European Chapter of the Association for Computational Linguistics*. Valencia, Spain. April 3-7, 2017.
 
 The model described in that paper has a strict subset of the features that are currently implemented.
 
